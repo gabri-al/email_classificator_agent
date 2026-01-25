@@ -15,3 +15,7 @@
 # **
  
 Building_Blocks_Classification.ipynb
+00_Data_Generation.ipynb
+01_Prompts.ipynb
+Building blocks/Building_Blocks_Classification.ipynb
+Building blocks/Building_Blocks_Retriever.ipynb
