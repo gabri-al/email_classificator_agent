@@ -1,39 +1,69 @@
-# Databricks notebook source
-# MAGIC %md
-# MAGIC # LangGraph Agent in Memory
-# MAGIC Defining the agent's graph (state, nodes, edges) and run it in memory.
 
-# COMMAND ----------
+#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
+# Variable definition
+#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 
-# MAGIC %md
-# MAGIC ## Env & Variables
-# MAGIC Running package install and defining global variables from separate Notebooks.
+## Variables pointing to Unity Catalog
+catalog_ = 'users'
+schema_ = 'gabriele_albini'
+lakebase_instance_ = 'gabriele-lb'
+llm_endpoint = 'databricks-claude-sonnet-4-5'
 
-# COMMAND ----------
+Assistant_Prompt = (
+  """
+    You are a customer support assistant, tasked with classifying incoming emails and suggesting following actions to improve customer relationship.\n\n
 
-# %run ./step_0_Environment
+    Use the available tools to:\n
+    * (When applicable) Retrieve the relevant context information to enrich the customer's email. If the required information to use a tool cannot be obtained or if any retrieval tool generates an error, assume that the related context is not available.\n
+    * Classify the email by assigning a label.\n
+    * Suggest the next steps.\n\n
+    
+    *Important*: If the initial request doesn't contain both the sender email address and the email body, return `Others` as final label, DO NOT call any other tool and ask the user to provide the required information.
 
-# COMMAND ----------
+    Once you've obtained a label for the email, STOP calling tools.
+  """)
 
-# MAGIC %run ./step_0_Variables
+Classification_Prompt = (
+  """
+    You are an email dispatcher assistant.\n
+    Based on the available context, your tasks are:\n
+        (1) Assign a label to the customer's email.\n
+        (2) Provide a summarized explanation of why you assigned such label.\n
+        (3) Recommend next steps, based on the context.\n\n
 
-# COMMAND ----------
+    Here are the available labels you can choose from, together with a description of when to use them:\n
+    * `Order Issues`: For emails about missing items, wrong orders, delayed shipments, tracking problems or any problem related to orders.\n
+    * `Returns & Refunds`: For requests or questions about return procedures, refund status, or exchange policies.\n
+    * `Claims & Complaints`: For defect reports, damaged goods, or any service dissatisfaction.\n
+    * `Account & Data Requests`: For customers asking to update personal information, manage account settings, or exercise data rights (e.g., GDPR requests).\n
+    * `Product Information`: For inquiries about product details, availability, sizing, or compatibility.\n
+    * `Payment & Billing`: For issues related to charges, payment methods, invoice requests, or failed transactions.\n
+    * `Spam`: for emails that are suspected of being a spam, not referring to any plausible customer's request or follow ups.\n
+    * `Others`: for emails that cannot be related to any of the previous labels.\n\n
 
-# MAGIC %run ./step_2_Prompts_Definition
+    Here is the contextual information.\n
 
-# COMMAND ----------
+    The body email sent by the customer:\n
+    `{email_body}`\n
 
-# MAGIC %md
-# MAGIC ## Schemas
-# MAGIC Defining the desired agent's State and output schemas.
+    The customer's information present in our database:\n
+    `{customer_info}`\n
 
-# COMMAND ----------
+    The most recent customer's order present in our database:\n
+    `{order_info}`\n
 
-# DBTITLE 1,Final Output Schema
+    The most recent customer's ticket present in our database:\n
+    `{ticket_info}`\n\n
+
+    *IMPORTANT*: Consider the following exceptions when choosing a label:
+    * If the email is a follow up to a previous ticket (e.g., the customer is sending a reply; the customer is acknowledging information;), assign the same label as the previous ticket.
+    
+    Now classify the email, explain your reasoning and recommend next steps.
+  """)
+
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Output Schema
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
 from pydantic import BaseModel, Field
 from typing import Literal
 
@@ -56,14 +86,9 @@ class FinalOutput(BaseModel):
   Rationale: str = Field(description="Reasoning behind the label choice")
   Next_steps: str = Field(description="Recommended action items based on the customer's email")
 
-
-# COMMAND ----------
-
-# DBTITLE 1,Graph State
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Graph State
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
 from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages, AnyMessage
@@ -74,42 +99,21 @@ class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     final_output: FinalOutput | None
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## LLMs
-# MAGIC Defining the base LLM to be used by the agent nodes.
-
-# COMMAND ----------
-
-# DBTITLE 1,Base LLM
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Base LLM
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 from databricks_langchain import ChatDatabricks
 model = ChatDatabricks(endpoint = llm_endpoint, temperature=0) 
 
-# COMMAND ----------
-
-# DBTITLE 1,Respond Model (LLM + Output schema)
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Respond Model (LLM + Output schema)
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 model_with_output_schema = model.with_structured_output(FinalOutput)
 
-# COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Tools
-# MAGIC Specify all tools the agent can use to retrieve information and classify emails.
-
-# COMMAND ----------
-
-# DBTITLE 1,Classification Tool
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Classification Tool
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
 from langchain_core.tools import tool
 from langgraph.graph import MessagesState
 
@@ -136,9 +140,7 @@ def classify_email(customer_info: str, order_info: str, ticket_info: str,  email
     result = model.invoke([full_prompt])
     return result.content
 
-# COMMAND ----------
 
-# DBTITLE 1,UC functions as Retrieval Tools
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # UC functions as Retrieval Tools
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
@@ -151,9 +153,6 @@ toolkit = UCFunctionToolkit(function_names=[
 ])
 uc_tools = toolkit.tools
 
-# COMMAND ----------
-
-# DBTITLE 1,Create Tool Binding
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Create Tool Binding
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
@@ -161,15 +160,6 @@ uc_tools = toolkit.tools
 tools = uc_tools + [classify_email] ## Combine all tools above (uc + custom)
 model_with_tools = model.bind_tools(tools)
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Nodes
-# MAGIC Creating the reasoning node (assistant) and the respond node.
-
-# COMMAND ----------
-
-# DBTITLE 1,Reasoning Node (Assistant)
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Reasoning Node (Assistant)
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
@@ -185,9 +175,6 @@ def assistant(state: AgentState) -> AgentState:
   result = model_with_tools.invoke([sys_msg] + state["messages"])
   return {"messages": state["messages"] + [result]}
 
-# COMMAND ----------
-
-# DBTITLE 1,Respond Node
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # Respond Node: Enforce output schema on the final answer
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
@@ -200,14 +187,6 @@ def respond(state: AgentState) -> AgentState:
     )
     return {"final_output": result}
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Graph
-
-# COMMAND ----------
-
-# DBTITLE 1,ReAct Graph
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 # ReAct Graph
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
@@ -236,73 +215,5 @@ builder.add_edge("tools", "assistant") # ReAct: return tool outputs to reason on
 builder.add_edge("respond", END)
 react_email_classifier = builder.compile() # No checkpointer (memory) needed
 
-# COMMAND ----------
-
-# DBTITLE 1,Display the Graph
-# Display the Graph
-display(Image(react_email_classifier.get_graph().draw_mermaid_png()))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Testing
-# MAGIC Run a test case with Notebook context
-
-# COMMAND ----------
-
-# DBTITLE 1,Import test cases
-## Save test cases
-spark.sql("USE CATALOG "+catalog_)
-spark.sql("USE SCHEMA "+schema_)
-df_test_emails = spark.table("classificator_agent_emails")
-
-# COMMAND ----------
-
-# DBTITLE 1,Pick Test case
-from pyspark.sql.functions import *
-
-# Extract test case from the dataframe with examples
-id_ = 7
-test_record = df_test_emails.filter(col("Email_Id") == id_).first()
-message_ = f"We received from: {test_record.Email_Sender} the following email: {test_record.Email_Body}"
-display(message_)
-
-# COMMAND ----------
-
-# DBTITLE 1,Launch Agent
-from pyspark.sql.functions import *
-from langchain_core.messages import HumanMessage
-
-# Invoke the Agent
-config_ = {"configurable": {"thread_id": id_}} # Not required if we're not using memory
-
-mlflow.langchain.autolog()
-with mlflow.start_run(run_name="React Email Classifier Agent - Test"):
-  request = [
-    HumanMessage(content = message_)
-  ]
-  messages = react_email_classifier.invoke({"messages": request}, config_)
-
-  for m in messages['messages']:
-      m.pretty_print()
-
-# COMMAND ----------
-
-# DBTITLE 1,Available Context: Customer Details
-# MAGIC %sql
-# MAGIC -- Available Context: Customer Details
-# MAGIC SELECT classificator_agent_customer_retriever('sofia.rossi@example.com') AS customer_details;
-
-# COMMAND ----------
-
-# DBTITLE 1,Available Context: Order
-# MAGIC %sql
-# MAGIC -- Available Context: Order Details
-# MAGIC SELECT classificator_agent_order_retriever(3) AS order_details;
-
-# COMMAND ----------
-
-# DBTITLE 1,Available Context: Ticket
-# MAGIC %sql
-# MAGIC -- Available Context: Ticket Details
-# MAGIC SELECT classificator_agent_ticket_retriever(3) AS ticket_details;
+import mlflow
+mlflow.models.set_model(react_email_classifier)
