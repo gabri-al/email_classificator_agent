@@ -142,78 +142,170 @@ def classify_email(customer_info: str, order_info: str, ticket_info: str,  email
 
 
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# UC functions as Retrieval Tools
+# MLflow PyFunc Wrapper for Unity Catalog Registration
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-from databricks_langchain import UCFunctionToolkit
-
-toolkit = UCFunctionToolkit(function_names=[
-      f"{catalog_}.{schema_}.classificator_agent_customer_retriever",
-      f"{catalog_}.{schema_}.classificator_agent_order_retriever",
-      f"{catalog_}.{schema_}.classificator_agent_ticket_retriever",
-])
-uc_tools = toolkit.tools
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Create Tool Binding
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
-tools = uc_tools + [classify_email] ## Combine all tools above (uc + custom)
-model_with_tools = model.bind_tools(tools)
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Reasoning Node (Assistant)
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
-from langgraph.graph import MessagesState
-from langchain_core.messages import HumanMessage, SystemMessage
-
-# System message
-sys_msg = SystemMessage(content=Assistant_Prompt)
-
-# Reasoning Node
-def assistant(state: AgentState) -> AgentState:
-  result = model_with_tools.invoke([sys_msg] + state["messages"])
-  return {"messages": state["messages"] + [result]}
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Respond Node: Enforce output schema on the final answer
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
-def respond(state: AgentState) -> AgentState:
-    # Uses the last message as input to the structured output model
-    last_msg = state["messages"][-1]
-    result = model_with_output_schema.invoke(
-        [HumanMessage(content=last_msg.content)]
-    )
-    return {"final_output": result}
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# ReAct Graph
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
-from langgraph.graph import START, StateGraph, END
-from langgraph.prebuilt import tools_condition
-from langgraph.prebuilt import ToolNode
-from IPython.display import Image, display
-
-# Graph
-builder = StateGraph(AgentState)
-
-# Add Nodes
-builder.add_node("assistant", assistant)
-builder.add_node("tools", ToolNode(tools))
-builder.add_node("respond", respond)
-
-# Define edges: these determine how the control flow moves
-builder.add_edge(START, "assistant")
-builder.add_conditional_edges(
-    "assistant",
-    tools_condition,
-    {"tools": "tools", "__end__": "respond"} # customize mapping which would route to end by default
-)
-builder.add_edge("tools", "assistant") # ReAct: return tool outputs to reason on it!
-builder.add_edge("respond", END)
-react_email_classifier = builder.compile() # No checkpointer (memory) needed
 
 import mlflow
-mlflow.models.set_model(react_email_classifier)
+import os
+from typing import Any, Dict, List
+
+class EmailClassifierAgent(mlflow.pyfunc.PythonModel):
+    """
+    MLflow PyFunc wrapper for the LangGraph email classification agent.
+    This class enables the agent to be registered in Unity Catalog and deployed
+    as a model serving endpoint with conversational agent format.
+    """
+    
+    def load_context(self, context):
+        """
+        Called when the model is loaded. Initializes the LangGraph agent with UC tools.
+        """
+        from databricks_langchain import UCFunctionToolkit
+        from databricks.sdk import WorkspaceClient
+        from langgraph.graph import START, StateGraph, END
+        from langgraph.prebuilt import tools_condition, ToolNode
+        
+        # Initialize Databricks client for UC function access
+        # In model serving, use environment variables for authentication
+        workspace_url = os.environ.get('DATABRICKS_HOST')
+        token = os.environ.get('DATABRICKS_TOKEN')
+        
+        if workspace_url and token:
+            w = WorkspaceClient(host=workspace_url, token=token)
+        else:
+            # Fallback to default authentication (for local testing)
+            w = WorkspaceClient()
+        
+        # Initialize UC Function Toolkit with client
+        toolkit = UCFunctionToolkit(
+            function_names=[
+                f"{catalog_}.{schema_}.classificator_agent_customer_retriever",
+                f"{catalog_}.{schema_}.classificator_agent_order_retriever",
+                f"{catalog_}.{schema_}.classificator_agent_ticket_retriever",
+            ],
+            client=w
+        )
+        uc_tools = toolkit.tools
+        
+        # Combine all tools
+        tools = uc_tools + [classify_email]
+        model_with_tools = model.bind_tools(tools)
+        
+        # System message
+        sys_msg = SystemMessage(content=Assistant_Prompt)
+        
+        # Reasoning Node
+        def assistant(state: AgentState) -> AgentState:
+            result = model_with_tools.invoke([sys_msg] + state["messages"])
+            return {"messages": state["messages"] + [result]}
+        
+        # Respond Node: Enforce output schema on the final answer
+        def respond(state: AgentState) -> AgentState:
+            last_msg = state["messages"][-1]
+            result = model_with_output_schema.invoke(
+                [HumanMessage(content=last_msg.content)]
+            )
+            return {"final_output": result}
+        
+        # Build the graph
+        builder = StateGraph(AgentState)
+        builder.add_node("assistant", assistant)
+        builder.add_node("tools", ToolNode(tools))
+        builder.add_node("respond", respond)
+        
+        builder.add_edge(START, "assistant")
+        builder.add_conditional_edges(
+            "assistant",
+            tools_condition,
+            {"tools": "tools", "__end__": "respond"}
+        )
+        builder.add_edge("tools", "assistant")
+        builder.add_edge("respond", END)
+        
+        self.agent = builder.compile()
+    
+    def predict(self, context, model_input, params=None):
+        """
+        Predict method for conversational agent format.
+        
+        Args:
+            context: MLflow context (not used)
+            model_input: Dict or List of dicts with 'messages' key containing conversation history
+            params: Optional parameters (not used)
+            
+        Returns:
+            Dict with classification results in the final_output field
+        """
+        # Handle both single dict and list of dicts
+        if isinstance(model_input, dict):
+            inputs = [model_input]
+        else:
+            inputs = model_input
+        
+        results = []
+        for input_data in inputs:
+            # Get messages from input
+            messages = input_data.get('messages', [])
+            
+            # If messages is a string, convert to message format
+            if isinstance(messages, str):
+                messages = [HumanMessage(content=messages)]
+            elif isinstance(messages, list) and len(messages) > 0:
+                # Convert dict messages to LangChain message objects if needed
+                converted_messages = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        role = msg.get('role', 'user')
+                        content = msg.get('content', '')
+                        if role == 'user':
+                            converted_messages.append(HumanMessage(content=content))
+                        elif role == 'assistant':
+                            converted_messages.append(AIMessage(content=content))
+                        else:
+                            converted_messages.append(HumanMessage(content=content))
+                    else:
+                        converted_messages.append(msg)
+                messages = converted_messages
+            else:
+                messages = [HumanMessage(content="No input provided")]
+            
+            # Invoke the agent
+            response = self.agent.invoke({"messages": messages})
+            
+            # Extract the final output
+            final_output = response.get('final_output')
+            
+            if final_output:
+                result = {
+                    'Customer_Email': final_output.Customer_Email,
+                    'Customer_Id': final_output.Customer_Id,
+                    'Customer_Context': final_output.Customer_Context,
+                    'Label': final_output.Label,
+                    'Rationale': final_output.Rationale,
+                    'Next_steps': final_output.Next_steps
+                }
+            else:
+                result = {
+                    'Customer_Email': 'Unknown',
+                    'Customer_Id': 'NULL',
+                    'Customer_Context': 'NULL',
+                    'Label': 'Classification Error',
+                    'Rationale': 'Agent failed to produce output',
+                    'Next_steps': 'Manual review required'
+                }
+            
+            results.append(result)
+        
+        # Return single dict if single input, otherwise list
+        return results[0] if len(results) == 1 else results
+
+#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
+# Load Model Function for MLflow Registration
+#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
+
+def load_model():
+    """
+    Factory function to create an instance of the EmailClassifierAgent.
+    This function is used during model registration with MLflow.
+    """
+    return EmailClassifierAgent()
