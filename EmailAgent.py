@@ -7,7 +7,7 @@
 catalog_ = 'users'
 schema_ = 'gabriele_albini'
 lakebase_instance_ = 'gabriele-lb'
-llm_endpoint = 'databricks-claude-sonnet-4-5'
+llm_endpoint = 'databricks-claude-haiku-4-5'
 
 Assistant_Prompt = (
   """
@@ -41,16 +41,16 @@ Classification_Prompt = (
     * `Spam`: for emails that are suspected of being a spam, not referring to any plausible customer's request or follow ups.\n
     * `Others`: for emails that cannot be related to any of the previous labels.\n\n
 
-    Here is the contextual information.\n
+    Here is the contextual information.\n\n
 
     The body email sent by the customer:\n
-    `{email_body}`\n
+    `{email_body}`\n\n
 
     The customer's information present in our database:\n
-    `{customer_info}`\n
+    `{customer_info}`\n\n
 
     The most recent customer's order present in our database:\n
-    `{order_info}`\n
+    `{order_info}`\n\n
 
     The most recent customer's ticket present in our database:\n
     `{ticket_info}`\n\n
@@ -100,94 +100,77 @@ class AgentState(TypedDict):
     final_output: FinalOutput | None
 
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Base LLM
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-from databricks_langchain import ChatDatabricks
-model = ChatDatabricks(endpoint = llm_endpoint, temperature=0) 
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Respond Model (LLM + Output schema)
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-model_with_output_schema = model.with_structured_output(FinalOutput)
-
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Classification Tool
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-from langchain_core.tools import tool
-from langgraph.graph import MessagesState
-
-@tool
-def classify_email(customer_info: str, order_info: str, ticket_info: str,  email_body: str) -> str:
-    """ Classify the customer's email into one of the predefined labels, based on the email_body and the available context you could retrieve:\n
-    * customer_info - representing the customer's details in our database\n
-    * order_info - representing the latest customer's order\n
-    * ticket_info - representing the latest customer's ticket\n
-    """
-    
-    # Promopt template
-    MODEL_SYSTEM_MESSAGE = Classification_Prompt
-
-    # Pass data to the prompt
-    full_prompt = MODEL_SYSTEM_MESSAGE.format(
-        email_body=email_body,
-        customer_info=customer_info,
-        order_info=order_info,
-        ticket_info=ticket_info
-    )
-
-    # Invoke LLM & return
-    result = model.invoke([full_prompt])
-    return result.content
-
-
-#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# MLflow PyFunc Wrapper for Unity Catalog Registration
+# ResponsesAgent Wrapper for Model Serving
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
 
 import mlflow
 import os
-from typing import Any, Dict, List
+from typing import Generator
+from mlflow.pyfunc import ResponsesAgent
+from mlflow.types.responses import (
+    ResponsesAgentRequest,
+    ResponsesAgentResponse,
+    ResponsesAgentStreamEvent,
+    output_to_responses_items_stream,
+    to_chat_completions_input,
+)
 
-class EmailClassifierAgent(mlflow.pyfunc.PythonModel):
+class EmailClassifierResponsesAgent(ResponsesAgent):
     """
-    MLflow PyFunc wrapper for the LangGraph email classification agent.
-    This class enables the agent to be registered in Unity Catalog and deployed
-    as a model serving endpoint with conversational agent format.
+    ResponsesAgent wrapper for the LangGraph email classification agent.
+    This enables deployment to Databricks Model Serving with OpenAI-compatible API.
     """
+    
+    def __init__(self):
+        """Initialize the agent. The actual graph will be built in load_context."""
+        self.agent = None
+        self._is_loaded = False
     
     def load_context(self, context):
         """
-        Called when the model is loaded. Initializes the LangGraph agent with UC tools.
+        Load the agent when the model is loaded for serving.
+        This is NOT called during registration, only when the model is loaded.
+        
+        Args:
+            context: MLflow context (not used but required by interface)
         """
-        from databricks_langchain import UCFunctionToolkit
-        from databricks.sdk import WorkspaceClient
+        # Skip loading if already loaded
+        if self._is_loaded:
+            return
+        
+        # Import dependencies here to avoid execution during registration
+        from databricks_langchain import ChatDatabricks, UCFunctionToolkit
+        from langchain_core.tools import tool
         from langgraph.graph import START, StateGraph, END
         from langgraph.prebuilt import tools_condition, ToolNode
         
-        # Initialize Databricks client for UC function access
-        # In model serving, use environment variables for authentication
-        workspace_url = os.environ.get('DATABRICKS_HOST')
-        token = os.environ.get('DATABRICKS_TOKEN')
+        # Base LLM
+        model = ChatDatabricks(endpoint=llm_endpoint, temperature=0)
+        model_with_output_schema = model.with_structured_output(FinalOutput)
         
-        if workspace_url and token:
-            w = WorkspaceClient(host=workspace_url, token=token)
-        else:
-            # Fallback to default authentication (for local testing)
-            w = WorkspaceClient()
+        # Classification Tool
+        @tool
+        def classify_email(customer_info: str, order_info: str, ticket_info: str, email_body: str) -> str:
+            """ Classify the customer's email into one of the predefined labels. """
+            full_prompt = Classification_Prompt.format(
+                email_body=email_body,
+                customer_info=customer_info,
+                order_info=order_info,
+                ticket_info=ticket_info
+            )
+            result = model.invoke([full_prompt])
+            return result.content
         
-        # Initialize UC Function Toolkit with client
-        toolkit = UCFunctionToolkit(
-            function_names=[
-                f"{catalog_}.{schema_}.classificator_agent_customer_retriever",
-                f"{catalog_}.{schema_}.classificator_agent_order_retriever",
-                f"{catalog_}.{schema_}.classificator_agent_ticket_retriever",
-            ],
-            client=w
-        )
+        # UC functions as Retrieval Tools
+        # UCFunctionToolkit automatically handles authentication via passthrough
+        toolkit = UCFunctionToolkit(function_names=[
+            f"{catalog_}.{schema_}.classificator_agent_customer_retriever",
+            f"{catalog_}.{schema_}.classificator_agent_order_retriever",
+            f"{catalog_}.{schema_}.classificator_agent_ticket_retriever",
+        ])
         uc_tools = toolkit.tools
         
-        # Combine all tools
+        # Combine tools
         tools = uc_tools + [classify_email]
         model_with_tools = model.bind_tools(tools)
         
@@ -199,20 +182,17 @@ class EmailClassifierAgent(mlflow.pyfunc.PythonModel):
             result = model_with_tools.invoke([sys_msg] + state["messages"])
             return {"messages": state["messages"] + [result]}
         
-        # Respond Node: Enforce output schema on the final answer
+        # Respond Node
         def respond(state: AgentState) -> AgentState:
             last_msg = state["messages"][-1]
-            result = model_with_output_schema.invoke(
-                [HumanMessage(content=last_msg.content)]
-            )
+            result = model_with_output_schema.invoke([HumanMessage(content=last_msg.content)])
             return {"final_output": result}
         
-        # Build the graph
+        # Build Graph
         builder = StateGraph(AgentState)
         builder.add_node("assistant", assistant)
         builder.add_node("tools", ToolNode(tools))
         builder.add_node("respond", respond)
-        
         builder.add_edge(START, "assistant")
         builder.add_conditional_edges(
             "assistant",
@@ -222,90 +202,68 @@ class EmailClassifierAgent(mlflow.pyfunc.PythonModel):
         builder.add_edge("tools", "assistant")
         builder.add_edge("respond", END)
         
+        # Compile and store the agent
         self.agent = builder.compile()
+        self._is_loaded = True
     
-    def predict(self, context, model_input, params=None):
+    def predict(self, request: ResponsesAgentRequest) -> ResponsesAgentResponse:
         """
-        Predict method for conversational agent format.
+        Synchronous prediction method required by ResponsesAgent.
+        Collects all output items from the stream.
         
         Args:
-            context: MLflow context (not used)
-            model_input: Dict or List of dicts with 'messages' key containing conversation history
-            params: Optional parameters (not used)
+            request: ResponsesAgentRequest containing input messages
             
         Returns:
-            Dict with classification results in the final_output field
+            ResponsesAgentResponse with output items and custom outputs
         """
-        # Handle both single dict and list of dicts
-        if isinstance(model_input, dict):
-            inputs = [model_input]
-        else:
-            inputs = model_input
+        # If agent hasn't been loaded yet, load it
+        if not self._is_loaded:
+            self.load_context(None)
         
-        results = []
-        for input_data in inputs:
-            # Get messages from input
-            messages = input_data.get('messages', [])
-            
-            # If messages is a string, convert to message format
-            if isinstance(messages, str):
-                messages = [HumanMessage(content=messages)]
-            elif isinstance(messages, list) and len(messages) > 0:
-                # Convert dict messages to LangChain message objects if needed
-                converted_messages = []
-                for msg in messages:
-                    if isinstance(msg, dict):
-                        role = msg.get('role', 'user')
-                        content = msg.get('content', '')
-                        if role == 'user':
-                            converted_messages.append(HumanMessage(content=content))
-                        elif role == 'assistant':
-                            converted_messages.append(AIMessage(content=content))
-                        else:
-                            converted_messages.append(HumanMessage(content=content))
-                    else:
-                        converted_messages.append(msg)
-                messages = converted_messages
-            else:
-                messages = [HumanMessage(content="No input provided")]
-            
-            # Invoke the agent
-            response = self.agent.invoke({"messages": messages})
-            
-            # Extract the final output
-            final_output = response.get('final_output')
-            
-            if final_output:
-                result = {
-                    'Customer_Email': final_output.Customer_Email,
-                    'Customer_Id': final_output.Customer_Id,
-                    'Customer_Context': final_output.Customer_Context,
-                    'Label': final_output.Label,
-                    'Rationale': final_output.Rationale,
-                    'Next_steps': final_output.Next_steps
-                }
-            else:
-                result = {
-                    'Customer_Email': 'Unknown',
-                    'Customer_Id': 'NULL',
-                    'Customer_Context': 'NULL',
-                    'Label': 'Classification Error',
-                    'Rationale': 'Agent failed to produce output',
-                    'Next_steps': 'Manual review required'
-                }
-            
-            results.append(result)
+        outputs = [
+            event.item
+            for event in self.predict_stream(request)
+            if event.type == "response.output_item.done"
+        ]
+        return ResponsesAgentResponse(
+            output=outputs,
+            custom_outputs=request.custom_inputs
+        )
+    
+    def predict_stream(
+        self,
+        request: ResponsesAgentRequest,
+    ) -> Generator[ResponsesAgentStreamEvent, None, None]:
+        """
+        Streaming prediction method that yields events as the agent processes.
         
-        # Return single dict if single input, otherwise list
-        return results[0] if len(results) == 1 else results
+        Args:
+            request: ResponsesAgentRequest containing input messages
+            
+        Yields:
+            ResponsesAgentStreamEvent items as the agent processes
+        """
+        # If agent hasn't been loaded yet, load it
+        if not self._is_loaded:
+            self.load_context(None)
+        
+        # Convert ResponsesAgent input format to chat completions format
+        cc_msgs = to_chat_completions_input([i.model_dump() for i in request.input])
+        
+        # Stream the agent execution
+        for _, events in self.agent.stream(
+            {"messages": cc_msgs},
+            stream_mode=["updates"]
+        ):
+            # Extract messages from each node's output
+            for node_data in events.values():
+                if "messages" in node_data:
+                    # Convert LangGraph messages to ResponsesAgent stream events
+                    yield from output_to_responses_items_stream(node_data["messages"])
 
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-# Load Model Function for MLflow Registration
+# Set model for code-based logging
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
-
-def load_model():
-    """
-    Factory function to create an instance of the EmailClassifierAgent.
-    This function is used during model registration with MLflow.
-    """
-    return EmailClassifierAgent()
+from mlflow.models import set_model
+set_model(EmailClassifierResponsesAgent())
