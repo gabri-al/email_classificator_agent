@@ -138,6 +138,10 @@ class EmailClassifierResponsesAgent(ResponsesAgent):
         if self._is_loaded:
             return
         
+        # Enable MLflow tracing for LangGraph
+        import mlflow
+        mlflow.langchain.autolog()
+        
         # Import dependencies here to avoid execution during registration
         from databricks_langchain import ChatDatabricks, UCFunctionToolkit
         from langchain_core.tools import tool
