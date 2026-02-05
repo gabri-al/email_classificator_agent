@@ -18,7 +18,17 @@ This Repo contains the code needed to build the custom agent on Databricks, usin
 
 ## LangGraph graph
 This agent leverages ReAct plus tool calling to classify emails and produce an output following a desired schema:
+<img width="218" height="357" alt="LangChain_Graph" src="https://github.com/user-attachments/assets/9a4115bb-07ca-4d5d-a6a5-7a2153f67f4a" />
 
 ## Example
-Here's an example from the mock up dataset produced by the agent, hosted on a Databricks Model Serving and using Playground as UI:
+Here's an example produced from the mock up dataset.
+
+* User's request:
+  
+  <img width="875" height="95" alt="image" src="https://github.com/user-attachments/assets/bc8dd676-bd82-45ef-a0b9-b7ea45bf32b2" />
+
+* Agent's response:
+  
+  <img width="877" height="528" alt="image" src="https://github.com/user-attachments/assets/6e49df5c-5d01-4ec7-a04b-338eff930999" />
+
 
