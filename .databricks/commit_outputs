@@ -14,12 +14,6 @@
 # Uncomment the following pattern to include output for all notebooks
 # **
  
-Building_Blocks_Classification.ipynb
-00_Data_Generation.ipynb
-01_Prompts.ipynb
-Building blocks/Building_Blocks_Classification.ipynb
-Building blocks/Building_Blocks_Retriever.ipynb
-03_Agent_Graph_inMemory.ipynb
-04_Tests.ipynb
-!00_Variables.ipynb
-!02_Prompts_Definition.ipynb
+!step0_Environment.ipynb
+step3_Agent_Graph_inMemory.ipynb
+step4_Tests.ipynb
