@@ -17,3 +17,4 @@
 !step0_Environment.ipynb
 step3_Agent_Graph_inMemory.ipynb
 step4_Tests.ipynb
+step5_DeployModel.ipynb
